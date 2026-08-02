@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: options-strategy
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scraper_api.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+
+  # Free-tier web services spin down after ~15 minutes idle. This cron job
+  # pings /healthz every 10 minutes to keep the service warm.
+  - type: cron
+    name: options-strategy-keepalive
+    env: python
+    region: oregon
+    plan: free
+    schedule: "*/10 * * * *"
+    buildCommand: pip install requests
+    startCommand: "python -c \"import requests, os; requests.get(os.environ['PING_URL'], timeout=20)\""
+    envVars:
+      - key: PING_URL
+        sync: false   # set this manually in Render dashboard to your deployed URL + /healthz
