@@ -32,10 +32,20 @@ MAX_CHAIN_HOPS = 5
 def _fetch_der_cert(host: str, port: int = 443) -> bytes:
     """Grab the raw leaf certificate from a live TLS connection, unverified."""
     import socket
+    print(f"[SSL SETUP] Connecting to {host}:{port} to read leaf cert...")
     ctx = ssl._create_unverified_context()
-    with socket.create_connection((host, port), timeout=10) as sock:
+    sock = socket.create_connection((host, port), timeout=8)
+    sock.settimeout(8)
+    try:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            return ssock.getpeercert(binary_form=True)
+            cert = ssock.getpeercert(binary_form=True)
+            print("[SSL SETUP] Leaf cert obtained.")
+            return cert
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 def _aia_issuer_url(cert: x509.Certificate) -> str | None:
     try:
@@ -57,24 +67,27 @@ def _walk_chain_and_build_bundle(host: str) -> str:
         der = _fetch_der_cert(host)
         cert = x509.load_der_x509_certificate(der, default_backend())
 
-        for _ in range(MAX_CHAIN_HOPS):
+        for hop in range(MAX_CHAIN_HOPS):
             url = _aia_issuer_url(cert)
             if not url:
+                print(f"[SSL SETUP] No further AIA issuer URL at hop {hop} — chain complete.")
                 break
-            print(f"[SSL SETUP] Fetching intermediate from {url}")
-            with urllib.request.urlopen(url, timeout=10) as resp:
+            print(f"[SSL SETUP] Hop {hop}: fetching intermediate from {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 issuer_der = resp.read()
             issuer_cert = x509.load_der_x509_certificate(issuer_der, default_backend())
             pem = issuer_cert.public_bytes(Encoding.PEM).decode()
             collected_pems.append(pem)
+            print(f"[SSL SETUP] Hop {hop}: got intermediate, subject={issuer_cert.subject.rfc4514_string()}")
 
-            # Self-signed = root reached, stop walking
             if issuer_cert.subject == issuer_cert.issuer:
+                print("[SSL SETUP] Reached self-signed root — stopping.")
                 break
-            cert = issuer_cert  # continue walking up
+            cert = issuer_cert
 
     except Exception as e:
-        print(f"[SSL SETUP] AIA chase failed: {e}")
+        print(f"[SSL SETUP] AIA chase failed ({type(e).__name__}): {e}")
         print("[SSL SETUP] Falling back to certifi-only bundle — connection may still fail.")
 
     return bundle + "\n" + "\n".join(collected_pems)
@@ -243,9 +256,27 @@ _wakeup     = asyncio.Event()
 _state_lock = asyncio.Lock()
 
 async def poller_task():
-    ssl_ctx = build_ssl_context()
+    print("[POLLER] Starting poller_task, building SSL context...")
+    try:
+        loop = asyncio.get_event_loop()
+        # Run the blocking cert-chain walk in a thread with a hard 20s cap —
+        # if it hangs (slow/blocked network on the host), we fall back to
+        # certifi-only rather than freezing the whole service forever.
+        ssl_ctx = await asyncio.wait_for(
+            loop.run_in_executor(None, build_ssl_context),
+            timeout=20.0,
+        )
+        print("[POLLER] SSL context ready.")
+    except asyncio.TimeoutError:
+        print("[POLLER] SSL setup timed out after 20s — falling back to plain certifi context.")
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception as e:
+        print(f"[POLLER] SSL setup failed ({type(e).__name__}: {e}) — falling back to plain certifi context.")
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
     async with aiohttp.ClientSession(connector=connector) as session:
+        print("[POLLER] Session ready, entering fetch loop.")
         while scraper_state["running"]:
             async with _state_lock:
                 pair     = scraper_state["pair"]
