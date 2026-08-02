@@ -187,7 +187,12 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
     }
 
     async with session.post(PRICING_URL, headers=headers, data=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-        resp.raise_for_status()
+        if resp.status != 200:
+            body_text = await resp.text()
+            print(f"[FETCH ERROR] Pricing API returned {resp.status} {resp.reason}")
+            print(f"[FETCH ERROR] Response headers: {dict(resp.headers)}")
+            print(f"[FETCH ERROR] Response body (first 2000 chars): {body_text[:2000]}")
+            resp.raise_for_status()
         result = await resp.json()
 
         # Server double-encodes: outer layer is JSON, but the value is itself
