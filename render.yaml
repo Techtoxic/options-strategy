@@ -10,6 +10,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: PYTHONUNBUFFERED
+        value: "1"
 
   # Free-tier web services spin down after ~15 minutes idle. This cron job
   # pings /healthz every 10 minutes to keep the service warm.
