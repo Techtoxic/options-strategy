@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Options Chain Live</title>
+  <style>
+    :root {
+      --bg: #0a0c0f;
+      --surface: #111418;
+      --border: #1e2530;
+      --accent: #00e5a0;
+      --accent2: #f0b429;
+      --red: #ff4f5e;
+      --text: #d6dde8;
+      --muted: #4a5568;
+      --atm-bg: rgba(0,229,160,0.07);
+      --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --font-ui: 'Inter', system-ui, sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--text); font-family: var(--font-ui);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 24px; border-bottom: 1px solid var(--border);
+      background: var(--surface); gap: 12px; flex-wrap: wrap;
+    }
+    .brand {
+      font-family: var(--font-mono); font-size: 0.78rem; letter-spacing: 0.15em;
+      color: var(--muted); text-transform: uppercase;
+    }
+    .meta { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px; background: var(--border);
+      border-radius: 6px; padding: 4px 10px; font-family: var(--font-mono);
+      font-size: 0.75rem; color: var(--text);
+    }
+    .badge.live    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s infinite; }
+    .badge.loading .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); animation: pulse 0.6s infinite; }
+    .badge.stale   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); animation: none; }
+    .badge.error   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); animation: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+    .controls {
+      display: flex; gap: 10px; padding: 14px 24px; border-bottom: 1px solid var(--border);
+      flex-wrap: wrap; align-items: center;
+    }
+    .control-group { display: flex; flex-direction: column; gap: 4px; }
+    label { font-size: 0.65rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+    select, input[type=number] {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text); font-family: var(--font-mono); font-size: 0.8rem;
+      padding: 6px 10px; cursor: pointer; outline: none; transition: border-color 0.2s;
+    }
+    select:focus, input[type=number]:focus { border-color: var(--accent); }
+    input[type=number] { width: 80px; }
+    .btn {
+      align-self: flex-end; background: var(--accent); color: #000; border: none;
+      border-radius: 6px; font-family: var(--font-mono); font-size: 0.78rem;
+      font-weight: 700; padding: 7px 14px; cursor: pointer; letter-spacing: 0.05em;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn.danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
+    main { flex: 1; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .card-header {
+      display: flex; align-items: baseline; justify-content: space-between;
+      padding: 14px 20px 10px; border-bottom: 1px solid var(--border); gap: 12px; flex-wrap: wrap;
+    }
+    .pair-name { font-family: var(--font-mono); font-size: 1.1rem; font-weight: 700; color: var(--accent2); letter-spacing: 0.05em; }
+    .expiry-tag {
+      background: rgba(240,180,41,0.12); color: var(--accent2); border-radius: 4px;
+      padding: 2px 8px; font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.1em;
+    }
+    .spot-val { margin-left: auto; font-family: var(--font-mono); font-size: 0.88rem; color: var(--text); }
+    .spot-val span { color: var(--muted); font-size: 0.72rem; margin-right: 4px; }
+    table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 0.8rem; }
+    thead tr { background: rgba(255,255,255,0.02); }
+    th {
+      padding: 8px 12px; text-align: right; font-size: 0.68rem; letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border);
+    }
+    th:first-child { text-align: left; }
+    th:nth-child(3) { color: var(--text); text-align: center; }
+    td { padding: 7px 12px; text-align: right; border-bottom: 1px solid rgba(30,37,48,0.5); transition: background 0.1s; }
+    td:first-child { text-align: left; }
+    .col-pdelta { color: #7dd3fc; }
+    .col-cdelta { color: var(--accent); }
+    .col-iv     { color: var(--accent2); }
+    .col-strike { text-align: center; color: white; font-weight: 600; }
+    tr.atm td { background: var(--atm-bg); }
+    tr.atm .col-strike::after { content: " ◈"; color: var(--accent); font-size: 0.7rem; }
+    tr:hover td { background: rgba(255,255,255,0.025); }
+    .state-msg {
+      padding: 48px; text-align: center; color: var(--muted); font-family: var(--font-mono);
+      font-size: 0.82rem; display: flex; flex-direction: column; align-items: center; gap: 14px;
+    }
+    .spinner {
+      width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    footer {
+      padding: 12px 24px; border-top: 1px solid var(--border); font-family: var(--font-mono);
+      font-size: 0.7rem; color: var(--muted); display: flex; justify-content: space-between;
+      flex-wrap: wrap; gap: 8px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="brand">⬡ Options Chain Monitor</div>
+  <div class="meta">
+    <div class="badge loading" id="statusBadge">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">Connecting…</span>
+    </div>
+    <div class="badge" id="timeBadge">--:--:-- UTC</div>
+  </div>
+</header>
+
+<div class="controls">
+  <div class="control-group">
+    <label>Pair</label>
+    <select id="pairSel">
+      <option>EUR-JPY</option><option>USD-JPY</option><option>EUR-USD</option>
+      <option>GBP-USD</option><option>GBP-JPY</option><option>AUD-USD</option>
+      <option>NZD-USD</option><option>EUR-CAD</option><option>EUR-CHF</option>
+      <option>EUR-GBP</option><option>EUR-AUD</option><option>USD-CHF</option>
+      <option>USD-CAD</option><option>USD-CNH</option><option>USD-ILS</option>
+      <option>USD-MXN</option><option>USD-TRY</option><option selected>XAU-USD</option>
+    </select>
+  </div>
+  <div class="control-group">
+    <label>Expiry</label>
+    <select id="expirySel">
+      <option selected>O/N</option>
+      <option>1W</option><option>2W</option><option>1M</option>
+      <option>2M</option><option>3M</option><option>6M</option><option>12M</option>
+    </select>
+  </div>
+  <div class="control-group">
+    <!-- min 0.2 = 200ms, matches backend MIN_INTERVAL -->
+    <label>Refresh (s)</label>
+    <input type="number" id="intervalInp" value="1" min="0.2" max="300" step="0.1">
+  </div>
+  <button class="btn" id="applyBtn">Apply</button>
+  <button class="btn danger" id="pauseBtn">Pause</button>
+</div>
+
+<main id="main">
+  <div class="state-msg"><div class="spinner"></div>Waiting for backend…</div>
+</main>
+
+<footer>
+  <span>Data: widget2.sentryd.com Pricing API (direct)</span>
+  <span id="footerInfo">--</span>
+</footer>
+
+<script>
+  const DATA_FILE  = 'options_live.json';
+  const MIN_MS     = 200;   // matches Python MIN_INTERVAL
+
+  let intervalMs   = 1000;
+  let paused       = false;
+  let loopRunning  = false;
+  let loopGen      = 0;      // generation counter — prevents duplicate loops
+  let tickCount    = 0;
+  let lastHash     = '';
+  let wantedPair   = document.getElementById('pairSel').value;
+  let wantedExpiry = document.getElementById('expirySel').value;
+
+  const $ = id => document.getElementById(id);
+
+  // ── Polling loop ──────────────────────────────────────────────────────
+  async function pollLoop(myGen) {
+    if (myGen !== loopGen) return;   // a newer loop superseded this one — stop
+    if (!paused) await fetchData();
+    if (myGen !== loopGen) return;   // config may have changed mid-fetch
+    setTimeout(() => pollLoop(myGen), intervalMs);
+  }
+
+  function startLoop() {
+    if (loopRunning) return;
+    loopRunning = true;
+    loopGen++;
+    pollLoop(loopGen);
+  }
+
+  function restartLoop(newMs) {
+    intervalMs = Math.max(MIN_MS, newMs);
+    loopGen++;               // invalidates any in-flight pollLoop callbacks
+    pollLoop(loopGen);        // start fresh immediately, no artificial delay
+  }
+
+  // ── Fetch & render ────────────────────────────────────────────────────
+  async function fetchData() {
+    try {
+      const res = await fetch(DATA_FILE + '?_=' + Date.now(), { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      $('timeBadge').textContent = (data.timestamp || '').slice(11, 19) + ' UTC';
+
+      if (!data.ready) {
+        setStatus('loading', `Loading ${data.pair}…`);
+        showSpinner(`Loading ${data.pair} / ${data.expiry}…`);
+        return;
+      }
+
+      if (data.pair !== wantedPair || data.expiry !== wantedExpiry) {
+        setStatus('loading', `Switching to ${wantedPair}…`);
+        showSpinner(`Switching to ${wantedPair} / ${wantedExpiry}…`);
+        return;
+      }
+
+      tickCount++;
+      setStatus('live', `Tick #${tickCount}`);
+
+      const hash = JSON.stringify(data);
+      if (hash !== lastHash) {
+        lastHash = hash;
+        renderChain(data);
+      }
+
+      $('footerInfo').textContent =
+        `Updated: ${new Date().toLocaleTimeString()} | ${data.pair} | ${data.expiry} | ${intervalMs}ms`;
+
+    } catch (e) {
+      setStatus('error', `Error: ${e.message}`);
+    }
+  }
+
+  function setStatus(type, text) {
+    $('statusBadge').className = `badge ${type}`;
+    $('statusText').textContent = text;
+  }
+
+  function showSpinner(msg) {
+    const main = $('main');
+    if (!main.querySelector('.state-msg')) {
+      main.innerHTML = `<div class="state-msg"><div class="spinner"></div><span id="stateMsgText">${msg}</span></div>`;
+    } else {
+      const el = $('stateMsgText');
+      if (el) el.textContent = msg;
+    }
+  }
+
+  function renderChain(data) {
+    const { pair, expiry, spot, chain } = data;
+
+    if (!chain || chain.length === 0) {
+      $('main').innerHTML = `<div class="state-msg">No chain rows. Waiting for backend…</div>`;
+      return;
+    }
+
+    const atmIdx = chain.reduce((best, row, i) =>
+      Math.abs(row.put_delta + 0.50) < Math.abs(chain[best].put_delta + 0.50) ? i : best
+    , 0);
+
+    // Dynamic spot precision: FX pairs need more decimals than XAU
+    const spotDecimals = spot != null ? (spot > 100 ? 2 : spot > 10 ? 3 : 5) : 3;
+
+    const rows = chain.map((row, i) => {
+      const atm = i === atmIdx;
+      return `
+        <tr class="${atm ? 'atm' : ''}">
+          <td class="col-pdelta">${row.put_delta.toFixed(2)}</td>
+          <td>${row.put_price.toFixed(4)}</td>
+          <td class="col-strike">${row.strike.toFixed(3)}</td>
+          <td>${row.call_price.toFixed(4)}</td>
+          <td class="col-cdelta">${row.call_delta.toFixed(2)}</td>
+          <td class="col-iv">${row.iv}</td>
+        </tr>`;
+    }).join('');
+
+    $('main').innerHTML = `
+      <div class="card">
+        <div class="card-header">
+          <span class="pair-name">${pair.replace('-', '/')}</span>
+          <span class="expiry-tag">${expiry}</span>
+          <span class="spot-val"><span>SPOT</span>${spot != null ? spot.toFixed(spotDecimals) : '--'}</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Put Δ</th><th>Put Price</th><th>Strike</th>
+              <th>Call Price</th><th>Call Δ</th><th>IV</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // ── Persist & restore settings ───────────────────────────────────────
+  const STORAGE_KEY = 'optchain_cfg';
+
+  function saveSettings(pair, expiry, interval) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ pair, expiry, interval })); } catch(e) {}
+  }
+  function loadSettings() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch(e) { return null; }
+  }
+
+  async function applyConfig(pair, expiry, interval) {
+    wantedPair   = pair;
+    wantedExpiry = expiry;
+    lastHash     = '';
+
+    showSpinner(`Loading ${pair} / ${expiry}…`);
+    setStatus('loading', `Applying ${pair}…`);
+    $('applyBtn').disabled = true;
+
+    try {
+      const res = await fetch('/config', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ pair, expiry, interval }),
+      });
+      if (res.ok) {
+        saveSettings(pair, expiry, interval);
+        restartLoop(Math.round(interval * 1000));
+      } else {
+        const err = await res.json();
+        setStatus('error', err.error || 'Config failed');
+      }
+    } catch (e) {
+      setStatus('error', 'Server unreachable');
+    } finally {
+      $('applyBtn').disabled = false;
+    }
+  }
+
+  $('applyBtn').addEventListener('click', () => {
+    const pair     = $('pairSel').value;
+    const expiry   = $('expirySel').value;
+    const interval = Math.max(MIN_MS / 1000, parseFloat($('intervalInp').value) || 1);
+    applyConfig(pair, expiry, interval);
+  });
+
+  $('pauseBtn').addEventListener('click', () => {
+    paused = !paused;
+    $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+    if (!paused) { lastHash = ''; fetchData(); }
+  });
+
+  // ── Boot ──────────────────────────────────────────────────────────────
+  (async function boot() {
+    const saved = loadSettings();
+    if (saved) {
+      const pairOpt = [...$('pairSel').options].find(o => o.value === saved.pair);
+      if (pairOpt) $('pairSel').value = saved.pair;
+      const expiryOpt = [...$('expirySel').options].find(o => o.value === saved.expiry);
+      if (expiryOpt) $('expirySel').value = saved.expiry;
+      if (saved.interval) $('intervalInp').value = saved.interval;
+
+      wantedPair   = saved.pair;
+      wantedExpiry = saved.expiry;
+      intervalMs   = Math.round(Math.max(MIN_MS / 1000, saved.interval) * 1000);
+
+      showSpinner(`Loading ${saved.pair} / ${saved.expiry}…`);
+      setStatus('loading', `Restoring ${saved.pair}…`);
+
+      try {
+        const res = await fetch('/config', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ pair: saved.pair, expiry: saved.expiry, interval: saved.interval }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          setStatus('error', err.error || 'Config failed on restore');
+        }
+      } catch(e) {
+        setStatus('error', 'Server unreachable on restore');
+      }
+      startLoop();
+    } else {
+      startLoop();
+    }
+  })();
+</script>
+</body>
+</html>
