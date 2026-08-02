@@ -57,12 +57,19 @@ def _aia_issuer_url(cert: x509.Certificate) -> str | None:
         pass
     return None
 
-def _walk_chain_and_build_bundle(host: str) -> str:
-    """Fetch leaf + walk AIA chain, return combined PEM bundle (certifi + fetched intermediates)."""
+def _walk_chain_and_build_bundle(host: str) -> tuple[str, bool]:
+    """Fetch leaf + walk AIA chain, return (combined PEM bundle, success).
+
+    success=False means the walk failed and we fell back to a certifi-only
+    bundle, which may not be enough to verify hosts (like widget2.sentryd.com)
+    that omit intermediates. Callers should NOT persist a failed bundle to
+    disk, or a single bad run poisons every future run permanently.
+    """
     with open(certifi.where(), "r") as f:
         bundle = f.read()
 
     collected_pems = []
+    success = True
     try:
         der = _fetch_der_cert(host)
         cert = x509.load_der_x509_certificate(der, default_backend())
@@ -89,18 +96,30 @@ def _walk_chain_and_build_bundle(host: str) -> str:
     except Exception as e:
         print(f"[SSL SETUP] AIA chase failed ({type(e).__name__}): {e}")
         print("[SSL SETUP] Falling back to certifi-only bundle — connection may still fail.")
+        success = False
 
-    return bundle + "\n" + "\n".join(collected_pems)
+    return bundle + "\n" + "\n".join(collected_pems), success
 
 def build_ssl_context() -> ssl.SSLContext:
     _CERT_CACHE_DIR.mkdir(exist_ok=True)
     combined_path = _CERT_CACHE_DIR / "combined_ca_bundle.pem"
 
     if not combined_path.exists():
-        bundle_text = _walk_chain_and_build_bundle("widget2.sentryd.com")
-        with open(combined_path, "w") as f:
-            f.write(bundle_text)
-        print(f"[SSL SETUP] Built combined trust bundle at {combined_path}")
+        bundle_text, success = _walk_chain_and_build_bundle("widget2.sentryd.com")
+        if success:
+            with open(combined_path, "w") as f:
+                f.write(bundle_text)
+            print(f"[SSL SETUP] Built combined trust bundle at {combined_path}")
+        else:
+            # Don't cache a broken bundle — that would poison every future
+            # startup permanently. Write it to a temp file for THIS run only
+            # so we still try (in case certifi alone is enough), and retry
+            # the real walk fresh next time the process starts.
+            print("[SSL SETUP] Chain walk failed — using uncached fallback bundle for this run only.")
+            fallback_path = _CERT_CACHE_DIR / "fallback_uncached.pem"
+            with open(fallback_path, "w") as f:
+                f.write(bundle_text)
+            return ssl.create_default_context(cafile=str(fallback_path))
 
     return ssl.create_default_context(cafile=str(combined_path))
 
@@ -296,6 +315,16 @@ async def poller_task():
 
                 print(f"[FETCH] {pair} {expiry} spot={data['spot']} rows={len(data['chain'])}")
 
+            except ssl.SSLCertVerificationError as e:
+                # Likely a stale/incomplete cached trust bundle from a previous
+                # bad run (see build_ssl_context). Self-heal: nuke the cache so
+                # the NEXT process restart rebuilds it properly. We can't fix
+                # the live connector without restarting, but this stops the
+                # service from being stuck broken forever.
+                print(f"[FETCH ERROR] SSL verification failed ({e}) — clearing cert cache for next restart.")
+                combined_path = _CERT_CACHE_DIR / "combined_ca_bundle.pem"
+                if combined_path.exists():
+                    combined_path.unlink()
             except Exception as e:
                 print(f"[FETCH ERROR] {e}")
 
