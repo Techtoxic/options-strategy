@@ -190,6 +190,51 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
 
         return result
 
+# Fast spot feed — confirmed via Network tab to update every few seconds,
+# unlike Pricing which is a rare/heavy full-chain recalculation.
+INSTRUMENTS_URL = "https://widget2.sentryd.com/widget/api/instruments/latest/" + \
+    ",".join(p.replace("/", "_") for p in [
+        "EUR/USD", "USD/JPY", "GBP/USD", "USD/CHF", "USD/CAD",
+        "AUD/USD", "NZD/USD", "EUR/CAD", "EUR/CHF", "EUR/GBP",
+        "EUR/JPY", "EUR/AUD", "GBP/JPY", "USD/CNH", "USD/ILS",
+        "USD/MXN", "USD/TRY", "XAU/USD",
+    ])
+
+async def fetch_spots(session: aiohttp.ClientSession) -> dict:
+    """
+    Fetch just the live spot prices — this endpoint updates every few
+    seconds (confirmed via Network tab), unlike Pricing which only
+    recalculates the full chain rarely. Returns {pair: mid_price}.
+    """
+    headers = {
+        "Authorization":  AUTH_HEADER,
+        "Accept":         "*/*",
+        "Origin":         "https://widget2.sentryd.com",
+        "Referer":        "https://widget2.sentryd.com/widget/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent":     (
+            "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/147.0.0.0 Mobile Safari/537.36"
+        ),
+    }
+    url = f"{INSTRUMENTS_URL}?ts={int(time.time() * 1000)}"
+
+    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        resp.raise_for_status()
+        result = await resp.json()
+        if isinstance(result, str):
+            result = json.loads(result)
+
+    spots = {}
+    for api_pair, info in result.items():
+        currency = info.get("currency")  # mid price field, per earlier capture
+        if currency is not None:
+            spots[api_pair] = float(currency)
+    return spots
+
 def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
     """Pull one product/tenor's chain out of the full Pricing response."""
     api_pair   = to_api_pair(pair)
@@ -261,13 +306,17 @@ scraper_state = {
     "running":      True,
     "raw_cache":    None,
     "raw_cache_ts": 0,
+    "live_spots":   {},   # api_pair -> latest mid price, updated frequently
 }
 
 _wakeup     = asyncio.Event()
 _state_lock = asyncio.Lock()
 
-async def poller_task():
-    print("[POLLER] Starting poller_task, building SSL context...")
+CHAIN_REFRESH_INTERVAL = 60.0  # Pricing endpoint is expensive; the real widget
+                                 # doesn't re-poll it often either — confirmed
+                                 # via Network tab, it only fires on load/switch.
+
+async def _build_ssl_context_safe():
     try:
         loop = asyncio.get_event_loop()
         ssl_ctx = await asyncio.wait_for(
@@ -275,43 +324,93 @@ async def poller_task():
             timeout=20.0,
         )
         print("[POLLER] SSL context ready.")
+        return ssl_ctx
     except asyncio.TimeoutError:
         print("[POLLER] SSL setup timed out after 20s — falling back to plain certifi context.")
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context(cafile=certifi.where())
     except Exception as e:
         print(f"[POLLER] SSL setup failed ({type(e).__name__}: {e}) — falling back to plain certifi context.")
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context(cafile=certifi.where())
+
+async def spot_poller_task(session: aiohttp.ClientSession):
+    """Fast loop — refreshes live spot prices for all pairs frequently."""
+    print("[SPOT POLLER] Starting.")
+    while scraper_state["running"]:
+        async with _state_lock:
+            interval = scraper_state["interval"]
+
+        try:
+            spots = await fetch_spots(session)
+            async with _state_lock:
+                scraper_state["live_spots"] = spots
+
+                # If we already have chain data for the current pair, patch
+                # its spot in place so the frontend sees a live-moving spot
+                # even between full chain recalculations.
+                data = scraper_state["data"]
+                if data is not None:
+                    api_pair = to_api_pair(scraper_state["pair"])
+                    fresh_spot = spots.get(api_pair)
+                    if fresh_spot is not None:
+                        data["spot"] = fresh_spot
+
+            print(f"[SPOT] fetched {len(spots)} pairs, XAU/USD={spots.get('XAU/USD')}")
+
+        except Exception as e:
+            print(f"[SPOT ERROR] {e}")
+
+        await asyncio.sleep(max(MIN_INTERVAL, interval))
+
+async def chain_poller_task(session: aiohttp.ClientSession):
+    """Slow loop — refreshes the full options chain (strikes/deltas/IV/Greeks)."""
+    print("[CHAIN POLLER] Starting.")
+    while scraper_state["running"]:
+        async with _state_lock:
+            pair   = scraper_state["pair"]
+            expiry = scraper_state["expiry"]
+
+        try:
+            raw = await fetch_pricing(session)
+            data = extract_chain(raw, pair, expiry)
+
+            async with _state_lock:
+                if scraper_state["pair"] == pair and scraper_state["expiry"] == expiry:
+                    # Overlay the freshest known spot immediately, in case
+                    # the spot poller has more recent data than this chain
+                    # snapshot's embedded spot.
+                    api_pair = to_api_pair(pair)
+                    fresher = scraper_state["live_spots"].get(api_pair)
+                    if fresher is not None:
+                        data["spot"] = fresher
+
+                    scraper_state["data"]         = data
+                    scraper_state["raw_cache"]    = raw
+                    scraper_state["raw_cache_ts"] = time.time()
+
+            print(f"[CHAIN] {pair} {expiry} spot={data['spot']} rows={len(data['chain'])}")
+
+        except Exception as e:
+            print(f"[CHAIN ERROR] {e}")
+
+        try:
+            await asyncio.wait_for(_wakeup.wait(), timeout=CHAIN_REFRESH_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            _wakeup.clear()
+
+async def poller_task():
+    """Sets up shared SSL/session, then runs fast spot + slow chain loops concurrently."""
+    print("[POLLER] Starting poller_task, building SSL context...")
+    ssl_ctx = await _build_ssl_context_safe()
 
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
     async with aiohttp.ClientSession(connector=connector) as session:
-        print("[POLLER] Session ready, entering fetch loop.")
-        while scraper_state["running"]:
-            async with _state_lock:
-                pair     = scraper_state["pair"]
-                expiry   = scraper_state["expiry"]
-                interval = scraper_state["interval"]
-
-            try:
-                raw = await fetch_pricing(session)
-                data = extract_chain(raw, pair, expiry)
-
-                async with _state_lock:
-                    if scraper_state["pair"] == pair and scraper_state["expiry"] == expiry:
-                        scraper_state["data"]         = data
-                        scraper_state["raw_cache"]    = raw
-                        scraper_state["raw_cache_ts"] = time.time()
-
-                print(f"[FETCH] {pair} {expiry} spot={data['spot']} rows={len(data['chain'])}")
-
-            except Exception as e:
-                print(f"[FETCH ERROR] {e}")
-
-            try:
-                await asyncio.wait_for(_wakeup.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                _wakeup.clear()
+        print("[POLLER] Session ready, launching spot + chain loops.")
+        await asyncio.gather(
+            spot_poller_task(session),
+            chain_poller_task(session),
+        )
 
 async def apply_config(new_pair=None, new_expiry=None, new_interval=None):
     async with _state_lock:
@@ -324,7 +423,11 @@ async def apply_config(new_pair=None, new_expiry=None, new_interval=None):
 
         raw = scraper_state["raw_cache"]
         if raw is not None and (time.time() - scraper_state["raw_cache_ts"]) < 2.0:
-            scraper_state["data"] = extract_chain(raw, scraper_state["pair"], scraper_state["expiry"])
+            data = extract_chain(raw, scraper_state["pair"], scraper_state["expiry"])
+            fresher = scraper_state["live_spots"].get(to_api_pair(scraper_state["pair"]))
+            if fresher is not None:
+                data["spot"] = fresher
+            scraper_state["data"] = data
         else:
             scraper_state["data"] = None
 
