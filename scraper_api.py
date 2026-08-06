@@ -169,7 +169,12 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
         "timestamp":           str(int(time.time() * 1000)),
     }
 
-    async with session.post(PRICING_URL, headers=headers, data=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+    # Cache-bust via URL query param too, in case a CDN/reverse-proxy in
+    # front of the API caches by URL+body and ignores the body's timestamp
+    # field for cache-key purposes.
+    url = f"{PRICING_URL}?_cb={int(time.time() * 1000)}"
+
+    async with session.post(url, headers=headers, data=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
         if resp.status != 200:
             body_text = await resp.text()
             print(f"[FETCH ERROR] Status {resp.status}. Response headers: {dict(resp.headers)}")
