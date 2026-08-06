@@ -153,6 +153,8 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
         "Sec-Fetch-Dest":  "empty",
         "Sec-Fetch-Mode":  "cors",
         "Sec-Fetch-Site":  "same-origin",
+        "Cache-Control":   "no-cache",
+        "Pragma":          "no-cache",
         "User-Agent":      (
             "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -204,6 +206,9 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
     spot = None
     if spot_bid is not None and spot_ask is not None:
         spot = (spot_bid + spot_ask) / 2
+
+    upstream_ts = product.get("TradeDate")
+    print(f"[EXTRACT] {pair} upstream TradeDate={upstream_ts} bid={spot_bid} ask={spot_ask} spot={spot}")
 
     tenor = next((t for t in product.get("Tenors", []) if t.get("Tenor") == tenor_code), None)
     chain = []
