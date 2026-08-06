@@ -312,9 +312,11 @@ scraper_state = {
 _wakeup     = asyncio.Event()
 _state_lock = asyncio.Lock()
 
-CHAIN_REFRESH_INTERVAL = 60.0  # Pricing endpoint is expensive; the real widget
-                                 # doesn't re-poll it often either — confirmed
-                                 # via Network tab, it only fires on load/switch.
+CHAIN_REFRESH_INTERVAL = 15.0  # Pricing endpoint is heavier than instruments/latest,
+                                 # but 60s left the chain (deltas/IV) visibly stale
+                                 # relative to the live spot. 15s balances freshness
+                                 # against not hammering an endpoint the widget itself
+                                 # treats as expensive.
 
 async def _build_ssl_context_safe():
     try:
