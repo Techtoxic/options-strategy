@@ -270,11 +270,24 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
                 call_bid = sp["Call"]["Bid"]
                 call_ask = sp["Call"]["Ask"]
 
-                put_price  = (put_bid["Rate"]  + put_ask["Rate"])  / 2
-                call_price = (call_bid["Rate"] + call_ask["Rate"]) / 2
-                put_delta  = put_bid["Greeks"]["Delta"]
-                call_delta = call_bid["Greeks"]["Delta"]
-                iv = put_bid.get("Volatility", 0) * 100
+                # CoreRate is more precise than Rate (Rate appears rounded/
+                # display-truncated in some captures, e.g. 0.0 vs 0.000054).
+                put_price  = (put_bid.get("CoreRate", put_bid["Rate"])  + put_ask.get("CoreRate", put_ask["Rate"]))  / 2
+                call_price = (call_bid.get("CoreRate", call_bid["Rate"]) + call_ask.get("CoreRate", call_ask["Rate"])) / 2
+
+                # Bid and Ask carry meaningfully different Greeks/Volatility
+                # (wide spread), and the widget appears to display mid-market
+                # values rather than bid-side only. Average both sides.
+                put_delta_bid  = put_bid["Greeks"]["Delta"]
+                put_delta_ask  = put_ask["Greeks"]["Delta"]
+                call_delta_bid = call_bid["Greeks"]["Delta"]
+                call_delta_ask = call_ask["Greeks"]["Delta"]
+                put_delta  = (put_delta_bid  + put_delta_ask)  / 2
+                call_delta = (call_delta_bid + call_delta_ask) / 2
+
+                iv_bid = put_bid.get("Volatility", 0)
+                iv_ask = put_ask.get("Volatility", 0)
+                iv = ((iv_bid + iv_ask) / 2) * 100
 
                 chain.append({
                     "put_delta":  round(put_delta, 4),
