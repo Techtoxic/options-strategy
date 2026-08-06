@@ -7,6 +7,8 @@ Talks directly to widget2.sentryd.com's Pricing API.
 
 import argparse
 import asyncio
+import json
+import os
 import ssl
 import time
 import urllib.request
@@ -22,15 +24,11 @@ from cryptography.hazmat.primitives.serialization import Encoding
 
 # -- SSL fix: widget2.sentryd.com's server doesn't send its full chain
 # (missing intermediate CA), which browsers work around via AIA chasing
-# but Python's ssl module does not. We replicate AIA chasing here: fetch
-# the leaf cert, follow its "CA Issuers" URL to get the intermediate,
-# and keep walking until we reach a cert already in the certifi trust
-# store (or run out of hops). Cached to disk so this only runs once.
+# but Python's ssl module does not. We replicate AIA chasing here.
 _CERT_CACHE_DIR = Path(__file__).parent / ".cert_cache"
 MAX_CHAIN_HOPS = 5
 
 def _fetch_der_cert(host: str, port: int = 443) -> bytes:
-    """Grab the raw leaf certificate from a live TLS connection, unverified."""
     import socket
     print(f"[SSL SETUP] Connecting to {host}:{port} to read leaf cert...")
     ctx = ssl._create_unverified_context()
@@ -47,7 +45,7 @@ def _fetch_der_cert(host: str, port: int = 443) -> bytes:
         except Exception:
             pass
 
-def _aia_issuer_url(cert: x509.Certificate) -> str | None:
+def _aia_issuer_url(cert: x509.Certificate):
     try:
         aia = cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess)
         for desc in aia.value:
@@ -58,7 +56,6 @@ def _aia_issuer_url(cert: x509.Certificate) -> str | None:
     return None
 
 def _walk_chain_and_build_bundle(host: str) -> str:
-    """Fetch leaf + walk AIA chain, return combined PEM bundle (certifi + fetched intermediates)."""
     with open(certifi.where(), "r") as f:
         bundle = f.read()
 
@@ -107,13 +104,23 @@ def build_ssl_context() -> ssl.SSLContext:
 # -- Constants --------------------------------------------------------------
 PRICING_URL = "https://widget2.sentryd.com/widget/sentry/api/Pricing"
 
-# NOTE: this is the auth for the /sentry/api/Pricing endpoint specifically —
-# confirmed via raw captured request. Decodes to currency_widget:currency_widget.
-# Different from the /api/instruments/latest endpoint's auth — don't mix them up.
+# Confirmed via raw captured browser request — decodes to
+# currency_widget:currency_widget. Specific to /sentry/api/Pricing.
 AUTH_HEADER = "Basic Y3VycmVuY3lfd2lkZ2V0OmN1cnJlbmN5X3dpZGdldA=="
 
-POST_ACCESS_CODE     = "sentryPricingApi"
-POST_ACCESS_PASSWORD = "sentrypricingapi_202"  # lowercase — confirmed via raw capture
+POST_ACCESS_CODE = "sentryPricingApi"
+
+def get_post_access_password() -> str:
+    """
+    The access password rotates daily: 'sentrypricingapi_' + day-of-year (UTC).
+    Confirmed empirically:
+      - 2026-07-21 (day 202, UTC) used suffix '_202'
+      - 2026-08-06 (day 218, UTC) used suffix '_218'
+    Not zero-padded based on observed 3-digit values. If single/double-digit
+    early-year days ever fail, try zero-padding to 3 digits as a fallback.
+    """
+    day_of_year = datetime.now(timezone.utc).timetuple().tm_yday
+    return f"sentrypricingapi_{day_of_year}"
 
 PRODUCTS = [
     "EUR/USD", "USD/JPY", "GBP/USD", "USD/CHF", "USD/CAD",
@@ -122,21 +129,14 @@ PRODUCTS = [
     "USD/MXN", "USD/TRY", "XAU/USD",
 ]
 
-# Maps our UI pair format (hyphenated) to the API's format (slash)
 def to_api_pair(pair: str) -> str:
     return pair.replace("-", "/")
 
-def to_ui_pair(pair: str) -> str:
-    return pair.replace("/", "-")
-
-# Tenor codes used by the API (confirmed: "ON" seen in payload for O/N)
 TENOR_MAP = {
     "O/N": "ON", "1W": "1W", "2W": "2W",
     "1M":  "1M", "2M": "2M", "3M": "3M",
     "6M":  "6M", "12M": "12M",
 }
-
-import os
 
 PORT         = int(os.environ.get("PORT", 8080))
 MIN_INTERVAL = 0.2
@@ -163,7 +163,7 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
         "Type":                "Pricing",
         "Products":            ",".join(PRODUCTS),
         "POSTAccessCode":      POST_ACCESS_CODE,
-        "POSTAccessPassword":  POST_ACCESS_PASSWORD,
+        "POSTAccessPassword":  get_post_access_password(),
         "timestamp":           str(int(time.time() * 1000)),
     }
 
@@ -176,17 +176,16 @@ async def fetch_pricing(session: aiohttp.ClientSession) -> dict:
 
         result = await resp.json()
 
-        # Server double-encodes: outer layer is JSON, but the value is itself
-        # a JSON string that needs a second parse.
+        # Server double-encodes: outer layer is JSON, but the value is
+        # itself a JSON string that needs a second parse.
         if isinstance(result, str):
-            import json as _json
-            result = _json.loads(result)
+            result = json.loads(result)
 
         return result
 
 def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
     """Pull one product/tenor's chain out of the full Pricing response."""
-    api_pair  = to_api_pair(pair)
+    api_pair   = to_api_pair(pair)
     tenor_code = TENOR_MAP.get(expiry, "ON")
 
     products = raw.get("Products", [])
@@ -200,7 +199,6 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
         }
 
     spot_data = product.get("Spot", {})
-    # Mid of bid/ask as the displayed spot
     spot_bid = spot_data.get("Bid", {}).get("Rate")
     spot_ask = spot_data.get("Ask", {}).get("Rate")
     spot = None
@@ -219,11 +217,9 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
 
                 put_price  = (put_bid["Rate"]  + put_ask["Rate"])  / 2
                 call_price = (call_bid["Rate"] + call_ask["Rate"]) / 2
-                # Use the ask-side greeks for delta display (matches widget convention;
-                # adjust if the dashboard should show bid-side or averaged instead)
                 put_delta  = put_bid["Greeks"]["Delta"]
                 call_delta = call_bid["Greeks"]["Delta"]
-                iv = put_bid.get("Volatility", 0) * 100  # convert to percentage
+                iv = put_bid.get("Volatility", 0) * 100
 
                 chain.append({
                     "put_delta":  round(put_delta, 4),
@@ -235,7 +231,7 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
                     "iv_float":   round(iv, 2),
                 })
             except (KeyError, TypeError):
-                continue  # skip malformed strike rows rather than crash the whole tick
+                continue
 
     return {
         "pair":      pair,
@@ -248,13 +244,13 @@ def extract_chain(raw: dict, pair: str, expiry: str) -> dict:
 
 # -- State & background poller -----------------------------------------------
 scraper_state = {
-    "pair":          "XAU-USD",
-    "expiry":        "O/N",
-    "interval":      1.0,
-    "data":          None,
-    "running":       True,
-    "raw_cache":     None,   # last full Pricing response (all products/tenors)
-    "raw_cache_ts":  0,
+    "pair":         "XAU-USD",
+    "expiry":       "O/N",
+    "interval":     1.0,
+    "data":         None,
+    "running":      True,
+    "raw_cache":    None,
+    "raw_cache_ts": 0,
 }
 
 _wakeup     = asyncio.Event()
@@ -264,9 +260,6 @@ async def poller_task():
     print("[POLLER] Starting poller_task, building SSL context...")
     try:
         loop = asyncio.get_event_loop()
-        # Run the blocking cert-chain walk in a thread with a hard 20s cap —
-        # if it hangs (slow/blocked network on the host), we fall back to
-        # certifi-only rather than freezing the whole service forever.
         ssl_ctx = await asyncio.wait_for(
             loop.run_in_executor(None, build_ssl_context),
             timeout=20.0,
@@ -293,7 +286,6 @@ async def poller_task():
                 data = extract_chain(raw, pair, expiry)
 
                 async with _state_lock:
-                    # Only publish if config hasn't changed mid-fetch
                     if scraper_state["pair"] == pair and scraper_state["expiry"] == expiry:
                         scraper_state["data"]         = data
                         scraper_state["raw_cache"]    = raw
@@ -320,14 +312,11 @@ async def apply_config(new_pair=None, new_expiry=None, new_interval=None):
         if new_interval is not None:
             scraper_state["interval"] = max(MIN_INTERVAL, float(new_interval))
 
-        # If we already have a fresh raw cache (<2s old), extract immediately —
-        # no need to wait for the next poll tick since all products/tenors
-        # are already in the cached response.
         raw = scraper_state["raw_cache"]
         if raw is not None and (time.time() - scraper_state["raw_cache_ts"]) < 2.0:
             scraper_state["data"] = extract_chain(raw, scraper_state["pair"], scraper_state["expiry"])
         else:
-            scraper_state["data"] = None  # force spinner until next fetch
+            scraper_state["data"] = None
 
     _wakeup.set()
     print(f"[CONFIG] {scraper_state['pair']} / {scraper_state['expiry']} @ {scraper_state['interval']}s")
@@ -392,11 +381,9 @@ async def start_server():
     app.router.add_post("/config", set_config)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render (and most PaaS) inject PORT via env var and require binding to 0.0.0.0
-    port = int(os.environ.get("PORT", PORT))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"\n\033[1;32mDashboard -> http://0.0.0.0:{port}\033[0m\n")
+    print(f"\n\033[1;32mDashboard -> http://0.0.0.0:{PORT}\033[0m\n")
     return runner
 
 async def main():
